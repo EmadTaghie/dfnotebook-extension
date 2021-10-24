@@ -20,7 +20,7 @@ import {
 
 import * as nbformat from '@jupyterlab/nbformat';
 
-import { ArrayExt, each, toArray } from '@lumino/algorithm';
+import { ArrayExt, each, findIndex, toArray } from '@lumino/algorithm';
 
 import { JSONObject, JSONExt } from '@lumino/coreutils';
 
@@ -1354,7 +1354,47 @@ export namespace NotebookActions {
     Private.changeCellType(notebook, 'markdown');
     Private.handleState(notebook, state);
   }
-
+  /**
+   * Finds the next heading that isn't a child of the given markdown heading.
+   * @param cell - "Child" cell that has become the active cell
+   * @param notebook - The target notebook widget.
+   */
+  export function findNextParentHeading(
+      cell: Cell,
+      notebook: Notebook
+  ): number {
+    let index = findIndex(
+        notebook.widgets,
+        (possibleCell: Cell, index: number) => {
+          return cell.model.id === possibleCell.model.id;
+        }
+    );
+    if (index === -1) {
+      return -1;
+    }
+    let childHeaderInfo = getHeadingInfo(cell);
+    for (index = index + 1; index < notebook.widgets.length; index++) {
+      let hInfo = getHeadingInfo(notebook.widgets[index]);
+      if (
+          hInfo.isHeading &&
+          hInfo.headingLevel <= childHeaderInfo.headingLevel
+      ) {
+        return index;
+      }
+    }
+    // else no parent header found. return the index of the last cell
+    return notebook.widgets.length;
+  }
+  export function getHeadingInfo(
+      cell: Cell
+  ): { isHeading: boolean; headingLevel: number; collapsed?: boolean } {
+    if (!(cell instanceof MarkdownCell)) {
+      return { isHeading: false, headingLevel: 7 };
+    }
+    let level = cell.headingInfo.level;
+    let collapsed = cell.headingCollapsed;
+    return { isHeading: level > 0, headingLevel: level, collapsed: collapsed };
+  }
   /**
    * Trust the notebook after prompting the user.
    *
