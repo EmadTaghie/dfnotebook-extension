@@ -125,8 +125,8 @@ export namespace CellDragUtils {
     nextX: number,
     nextY: number
   ): boolean {
-    let dx = Math.abs(nextX - prevX);
-    let dy = Math.abs(nextY - prevY);
+    const dx = Math.abs(nextX - prevX);
+    const dy = Math.abs(nextY - prevY);
     return dx >= DRAG_THRESHOLD || dy >= DRAG_THRESHOLD;
   }
 
@@ -143,7 +143,8 @@ export namespace CellDragUtils {
     const count = selectedCells.length;
     let promptNumber: string;
     if (activeCell.model.type === 'code') {
-      let executionCount = (activeCell.model as ICodeCellModel).executionCount;
+      const executionCount = (activeCell.model as ICodeCellModel)
+        .executionCount;
       promptNumber = ' ';
       if (executionCount) {
         promptNumber = executionCount.toString();

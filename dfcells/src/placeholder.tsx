@@ -59,7 +59,7 @@ export abstract class Placeholder extends ReactWidget {
    * Handle the click event.
    */
   protected handleClick(e: React.MouseEvent<HTMLDivElement>): void {
-    let callback = this._callback;
+    const callback = this._callback;
     callback(e);
   }
 
