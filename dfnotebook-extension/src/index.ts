@@ -71,6 +71,8 @@ import { IStateDB } from '@jupyterlab/statedb';
 
 import { IStatusBar } from '@jupyterlab/statusbar';
 
+import { ITranslator, nullTranslator } from '@jupyterlab/translation';
+
 import { buildIcon, notebookIcon } from '@jupyterlab/ui-components';
 
 import { ArrayExt } from '@lumino/algorithm';
@@ -250,7 +252,7 @@ const FORMAT_EXCLUDE = ['notebook', 'python', 'custom'];
  * The exluded Cell Inspector Raw NbConvert Formats
  * (returned from nbconvert's export list)
  */
-const RAW_FORMAT_EXCLUDE = ['pdf', 'slides', 'script', 'notebook', 'custom'];
+// const RAW_FORMAT_EXCLUDE = ['pdf', 'slides', 'script', 'notebook', 'custom'];
 
 /**
  * The default Export To ... formats and their human readable labels.
@@ -427,20 +429,24 @@ function activateNotebookTools(
   tracker: INotebookTracker,
   editorServices: IEditorServices,
   state: IStateDB,
+  translator: ITranslator,
   inspectorProvider: IPropertyInspectorProvider | null
 ): INotebookTools {
+  const trans = translator.load('jupyterlab');
   const id = 'notebook-tools';
   // FIXME as unknown
-  const notebookTools = new NotebookTools({ tracker: tracker as unknown as NotebookTracker });
+  const notebookTools = new NotebookTools({ tracker: tracker as unknown as NotebookTracker, translator });
   const activeCellTool = new NotebookTools.ActiveCellTool();
-  const slideShow = NotebookTools.createSlideShowSelector();
+  const slideShow = NotebookTools.createSlideShowSelector(translator);
   const editorFactory = editorServices.factoryService.newInlineEditor;
   const cellMetadataEditor = new NotebookTools.CellMetadataEditorTool({
     editorFactory,
-    collapsed: false
+    collapsed: false,
+    translator
   });
   const notebookMetadataEditor = new NotebookTools.NotebookMetadataEditorTool({
-    editorFactory
+    editorFactory,
+    translator
   });
 
   const services = app.serviceManager;
@@ -460,26 +466,49 @@ function activateNotebookTools(
     }
     return true;
   };
-  let optionsMap: { [key: string]: JSONValue } = {};
+  const optionsMap: { [key: string]: JSONValue } = {};
   optionsMap.None = null;
   void services.nbconvert.getExportFormats().then(response => {
     if (response) {
+      /**
+       * The excluded Cell Inspector Raw NbConvert Formats
+       * (returned from nbconvert's export list)
+       */
+      const rawFormatExclude = [
+        'pdf',
+        'slides',
+        'script',
+        'notebook',
+        'custom'
+      ];
+      let optionValueArray: any = [
+        [trans.__('PDF'), 'pdf'],
+        [trans.__('Slides'), 'slides'],
+        [trans.__('Script'), 'script'],
+        [trans.__('Notebook'), 'notebook'],
+        [trans.__('Custom'), 'custom']
+      ];
+
       // convert exportList to palette and menu items
       const formatList = Object.keys(response);
-      formatList.forEach(function(key) {
-        if (RAW_FORMAT_EXCLUDE.indexOf(key) === -1) {
-          let capCaseKey = key[0].toUpperCase() + key.substr(1);
-          let labelStr = FORMAT_LABEL[key] ? FORMAT_LABEL[key] : capCaseKey;
-          let mimeType = response[key].output_mimetype;
-          optionsMap[labelStr] = mimeType;
+      const formatLabels = Private.getFormatLabels(translator);
+      formatList.forEach(function (key) {
+        if (rawFormatExclude.indexOf(key) === -1) {
+          const altOption = trans.__(key[0].toUpperCase() + key.substr(1));
+          const option = formatLabels[key] ? formatLabels[key] : altOption;
+          const mimeTypeValue = response[key].output_mimetype;
+          optionValueArray.push([option, mimeTypeValue]);
         }
       });
-      const nbConvert = NotebookTools.createNBConvertSelector(optionsMap);
+      const nbConvert = NotebookTools.createNBConvertSelector(
+        optionValueArray,
+        translator
+      );
       notebookTools.addItem({ tool: nbConvert, section: 'common', rank: 3 });
     }
   });
   notebookTools.title.icon = buildIcon;
-  notebookTools.title.caption = 'Notebook Tools';
+  notebookTools.title.caption = trans.__('Notebook Tools');
   notebookTools.id = id;
 
   notebookTools.addItem({ tool: activeCellTool, section: 'common', rank: 1 });
@@ -2370,7 +2399,21 @@ namespace Private {
 
     return commands.execute('console:create', options);
   }
-
+  export function getFormatLabels(
+      translator: ITranslator
+  ): { [k: string]: string } {
+    translator = translator || nullTranslator;
+    const trans = translator.load('jupyterlab');
+    return {
+      html: trans.__('HTML'),
+      latex: trans.__('LaTeX'),
+      markdown: trans.__('Markdown'),
+      pdf: trans.__('PDF'),
+      rst: trans.__('ReStructured Text'),
+      script: trans.__('Executable Script'),
+      slides: trans.__('Reveal.js Slides')
+    };
+  }
   /**
    * A widget hosting a cloned output area.
    */
