@@ -346,6 +346,7 @@ export const commandEditItem: JupyterFrontEndPlugin<void> = {
   activate: (
     app: JupyterFrontEnd,
     tracker: INotebookTracker,
+    translator: ITranslator,
     statusBar: IStatusBar | null
   ) => {
     if (!statusBar) {
@@ -353,7 +354,7 @@ export const commandEditItem: JupyterFrontEndPlugin<void> = {
       return;
     }
     const { shell } = app;
-    const item = new CommandEditStatus();
+    const item = new CommandEditStatus(translator);
 
     // Keep the status item up-to-date with the current notebook.
     tracker.currentChanged.connect(() => {
@@ -380,11 +381,12 @@ export const commandEditItem: JupyterFrontEndPlugin<void> = {
 export const notebookTrustItem: JupyterFrontEndPlugin<void> = {
   id: 'dfnotebook-extension:trust-status',
   autoStart: true,
-  requires: [INotebookTracker],
+  requires: [INotebookTracker, ITranslator],
   optional: [IStatusBar],
   activate: (
     app: JupyterFrontEnd,
     tracker: INotebookTracker,
+    tranlator: ITranslator,
     statusBar: IStatusBar | null
   ) => {
     if (!statusBar) {
@@ -392,7 +394,7 @@ export const notebookTrustItem: JupyterFrontEndPlugin<void> = {
       return;
     }
     const { shell } = app;
-    const item = new NotebookTrustStatus();
+    const item = new NotebookTrustStatus(tranlator);
 
     // Keep the status item up-to-date with the current notebook.
     tracker.currentChanged.connect(() => {
@@ -424,7 +426,9 @@ const widgetFactoryPlugin: JupyterFrontEndPlugin<NotebookWidgetFactory.IFactory>
   requires: [
     NotebookPanel.IContentFactory,
     IEditorServices,
-    IRenderMimeRegistry
+    IRenderMimeRegistry,
+    ISessionContextDialogs,
+    ITranslator
   ],
   activate: activateWidgetFactory,
   autoStart: true
