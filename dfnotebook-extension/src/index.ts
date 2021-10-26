@@ -1,5 +1,9 @@
 // Copyright (c) Jupyter Development Team.
 // Distributed under the terms of the Modified BSD License.
+/**
+ * @packageDocumentation
+ * @module notebook-extension
+ */
 
 import {
   ILayoutRestorer,
@@ -21,7 +25,7 @@ import { CodeCell } from '@dfnotebook/dfcells';
 
 import { IEditorServices } from '@jupyterlab/codeeditor';
 
-import { PageConfig, URLExt } from '@jupyterlab/coreutils';
+import { PageConfig } from '@jupyterlab/coreutils';
 
 import { IDocumentManager } from '@jupyterlab/docmanager';
 
@@ -92,7 +96,9 @@ import { DisposableSet } from '@lumino/disposable';
 
 import { Message, MessageLoop } from '@lumino/messaging';
 
-import { Panel, Menu } from '@lumino/widgets';
+import { Panel } from '@lumino/widgets';
+
+import { logNotebookOutput } from './nboutput';
 
 /**
  * The command IDs used by the notebook plugin.
@@ -190,6 +196,10 @@ namespace CommandIDs {
 
   export const merge = 'notebook:merge-cells';
 
+  export const mergeAbove = 'notebook:merge-cell-above';
+
+  export const mergeBelow = 'notebook:merge-cell-below';
+
   export const split = 'notebook:split-cell-at-cursor';
 
   export const commandMode = 'notebook:enter-command-mode';
@@ -228,6 +238,10 @@ namespace CommandIDs {
 
   export const showAllOutputs = 'notebook:show-all-cell-outputs';
 
+  export const toggleRenderSideBySide = 'notebook:toggle-render-side-by-side';
+
+  export const setSideBySideRatio = 'notebook:set-side-by-side-ratio';
+
   export const enableOutputScrolling = 'notebook:enable-output-scrolling';
 
   export const disableOutputScrolling = 'notebook:disable-output-scrolling';
@@ -235,6 +249,14 @@ namespace CommandIDs {
   export const selectLastRunCell = 'notebook:select-last-run-cell';
 
   export const replaceSelection = 'notebook:replace-selection';
+
+  export const autoClosingBrackets = 'notebook:toggle-autoclosing-brackets';
+
+  export const toggleCollapseCmd = 'Collapsible_Headings:Toggle_Collapse';
+
+  export const collapseAllCmd = 'Collapsible_Headings:Collapse_All';
+
+  export const expandAllCmd = 'Collapsible_Headings:Expand_All';
 }
 
 /**
@@ -246,7 +268,7 @@ const FACTORY = 'Notebook';
  * The exluded Export To ...
  * (returned from nbconvert's export list)
  */
-const FORMAT_EXCLUDE = ['notebook', 'python', 'custom'];
+// const FORMAT_EXCLUDE = ['notebook', 'python', 'custom'];
 
 /**
  * The exluded Cell Inspector Raw NbConvert Formats
@@ -257,15 +279,15 @@ const FORMAT_EXCLUDE = ['notebook', 'python', 'custom'];
 /**
  * The default Export To ... formats and their human readable labels.
  */
-const FORMAT_LABEL: { [k: string]: string } = {
-  html: 'HTML',
-  latex: 'LaTeX',
-  markdown: 'Markdown',
-  pdf: 'PDF',
-  rst: 'ReStructured Text',
-  script: 'Executable Script',
-  slides: 'Reveal.js Slides'
-};
+// const FORMAT_LABEL: { [k: string]: string } = {
+//   html: 'HTML',
+//   latex: 'LaTeX',
+//   markdown: 'Markdown',
+//   pdf: 'PDF',
+//   rst: 'ReStructured Text',
+//   script: 'Executable Script',
+//   slides: 'Reveal.js Slides'
+// };
 
 /**
  * The notebook widget tracker provider.
@@ -273,7 +295,7 @@ const FORMAT_LABEL: { [k: string]: string } = {
 const trackerPlugin: JupyterFrontEndPlugin<INotebookTracker> = {
   id: 'dfnotebook-extension:tracker',
   provides: INotebookTracker,
-  requires: [INotebookWidgetFactory, IDocumentManager],
+  requires: [INotebookWidgetFactory, ITranslator],
   optional: [
     ICommandPalette,
     IFileBrowserFactory,
@@ -417,7 +439,8 @@ const plugins: JupyterFrontEndPlugin<any>[] = [
   tools,
   commandEditItem,
   notebookTrustItem,
-  widgetFactoryPlugin
+  widgetFactoryPlugin,
+  logNotebookOutput
 ];
 export default plugins;
 
@@ -545,7 +568,9 @@ function activateWidgetFactory(
   app: JupyterFrontEnd,
   contentFactory: NotebookPanel.IContentFactory,
   editorServices: IEditorServices,
-  rendermime: IRenderMimeRegistry
+  rendermime: IRenderMimeRegistry,
+  sessionContextDialogs: ISessionContextDialogs,
+  translator: ITranslator
 ): NotebookWidgetFactory.IFactory {
   const factory = new NotebookWidgetFactory({
     name: FACTORY,
@@ -558,7 +583,9 @@ function activateWidgetFactory(
     contentFactory,
     editorConfig: StaticNotebook.defaultEditorConfig,
     notebookConfig: StaticNotebook.defaultNotebookConfig,
-    mimeTypeService: editorServices.mimeTypeService
+    mimeTypeService: editorServices.mimeTypeService,
+    sessionDialogs: sessionContextDialogs,
+    translator: translator
   });
   app.docRegistry.addWidgetFactory(factory);
   return factory;
@@ -571,6 +598,7 @@ function activateNotebookHandler(
   app: JupyterFrontEnd,
   factory: NotebookWidgetFactory.IFactory,
   docManager: IDocumentManager,
+  translator: ITranslator,
   palette: ICommandPalette | null,
   browserFactory: IFileBrowserFactory | null,
   launcher: ILauncher | null,
@@ -579,38 +607,84 @@ function activateNotebookHandler(
   settingRegistry: ISettingRegistry | null,
   sessionDialogs: ISessionContextDialogs | null
 ): INotebookTracker {
-  console.log("STARTING NOTEBOOK HANDLER!");
+  const trans = translator.load('jupyterlab');
   const services = app.serviceManager;
 
   const { commands } = app;
   const tracker = new NotebookTracker({ namespace: 'notebook' });
+
   const clonedOutputs = new WidgetTracker<
-    MainAreaWidget<Private.ClonedOutputArea>
-  >({
+      MainAreaWidget<Private.ClonedOutputArea>
+      >({
     namespace: 'cloned-outputs'
   });
 
+  // Fetch settings if possible.
+  const fetchSettings = settingRegistry
+    ? settingRegistry.load(trackerPlugin.id)
+    : Promise.reject(new Error(`No setting registry for ${trackerPlugin.id}`));
+
   // Handle state restoration.
   if (restorer) {
+    fetchSettings
+      .then(settings => {
+        updateConfig(settings);
+        settings.changed.connect(() => {
+          updateConfig(settings);
+        });
+        commands.addCommand(CommandIDs.autoClosingBrackets, {
+          execute: args => {
+            const codeConfig = settings.get('codeCellConfig')
+              .composite as JSONObject;
+            const markdownConfig = settings.get('markdownCellConfig')
+              .composite as JSONObject;
+            const rawConfig = settings.get('rawCellConfig')
+              .composite as JSONObject;
+
+            const anyToggled =
+              codeConfig.autoClosingBrackets ||
+              markdownConfig.autoClosingBrackets ||
+              rawConfig.autoClosingBrackets;
+            const toggled = !!(args['force'] ?? !anyToggled);
+            [
+              codeConfig.autoClosingBrackets,
+              markdownConfig.autoClosingBrackets,
+              rawConfig.autoClosingBrackets
+            ] = [toggled, toggled, toggled];
+
+            void settings.set('codeCellConfig', codeConfig);
+            void settings.set('markdownCellConfig', markdownConfig);
+            void settings.set('rawCellConfig', rawConfig);
+          },
+          label: trans.__('Auto Close Brackets for All Notebook Cell Types'),
+          isToggled: () =>
+            ['codeCellConfig', 'markdownCellConfig', 'rawCellConfig'].some(
+              x => (settings.get(x).composite as JSONObject).autoClosingBrackets
+            )
+        });
+      })
+      .catch((reason: Error) => {
+        console.warn(reason.message);
+        updateTracker({
+          editorConfig: factory.editorConfig,
+          notebookConfig: factory.notebookConfig,
+          kernelShutdown: factory.shutdownOnClose
+        });
+      });
     void restorer.restore(tracker, {
       command: 'docmanager:open',
       args: panel => ({ path: panel.context.path, factory: FACTORY }),
       name: panel => panel.context.path,
       when: services.ready
     });
-    void restorer.restore(clonedOutputs, {
-      command: CommandIDs.createOutputView,
-      args: widget => ({
-        path: widget.content.path,
-        index: widget.content.index
-      }),
-      name: widget => `${widget.content.path}:${widget.content.index}`,
-      when: tracker.restored // After the notebook widgets (but not contents).
-    });
   }
 
-  let registry = app.docRegistry;
-  registry.addModelFactory(new NotebookModelFactory({}));
+  const registry = app.docRegistry;
+  const modelFactory = new NotebookModelFactory({
+    disableDocumentWideUndoRedo:
+      factory.notebookConfig.disableDocumentWideUndoRedo
+  });
+  registry.addModelFactory(modelFactory);
 
   addCommands(
     app,
@@ -621,12 +695,12 @@ function activateNotebookHandler(
     sessionDialogs
   );
   if (palette) {
-    populatePalette(palette, services);
+    populatePalette(palette, translator);
   }
 
   let id = 0; // The ID counter for notebook panels.
 
-  let ft = app.docRegistry.getFileType('notebook');
+  const ft = app.docRegistry.getFileType('notebook');
 
   factory.widgetCreated.connect((sender, widget) => {
     // If the notebook panel does not have an ID, assign it one.
@@ -658,17 +732,17 @@ function activateNotebookHandler(
    * Update the setting values.
    */
   function updateConfig(settings: ISettingRegistry.ISettings): void {
-    let code = {
+    const code = {
       ...StaticNotebook.defaultEditorConfig.code,
       ...(settings.get('codeCellConfig').composite as JSONObject)
     };
 
-    let markdown = {
+    const markdown = {
       ...StaticNotebook.defaultEditorConfig.markdown,
       ...(settings.get('markdownCellConfig').composite as JSONObject)
     };
 
-    let raw = {
+    const raw = {
       ...StaticNotebook.defaultEditorConfig.raw,
       ...(settings.get('rawCellConfig').composite as JSONObject)
     };
@@ -692,6 +766,10 @@ function activateNotebookHandler(
     factory.shutdownOnClose = settings.get('kernelShutdown')
       .composite as boolean;
 
+    modelFactory.disableDocumentWideUndoRedo = settings.get(
+        'experimentalDisableDocumentWideUndoRedo'
+    ).composite as boolean;
+
     updateTracker({
       editorConfig: factory.editorConfig,
       notebookConfig: factory.notebookConfig,
@@ -699,31 +777,9 @@ function activateNotebookHandler(
     });
   }
 
-  // Fetch settings if possible.
-  const fetchSettings = settingRegistry
-    ? settingRegistry.load(trackerPlugin.id)
-    : Promise.reject(new Error(`No setting registry for ${trackerPlugin.id}`));
-  app.restored
-    .then(() => fetchSettings)
-    .then(settings => {
-      updateConfig(settings);
-      settings.changed.connect(() => {
-        updateConfig(settings);
-      });
-    })
-    .catch((reason: Error) => {
-      console.warn(reason.message);
-      updateTracker({
-        editorConfig: factory.editorConfig,
-        notebookConfig: factory.notebookConfig,
-        kernelShutdown: factory.shutdownOnClose
-      });
-    });
-
   // Add main menu notebook menu.
   if (mainMenu) {
-    // FIXME as unknown
-    populateMenus(app, mainMenu, tracker as unknown as INotebookTracker, services, palette, sessionDialogs);
+    populateMenus(app, mainMenu, tracker as unknown as INotebookTracker, translator, sessionDialogs);
   }
 
   // Utility function to create a new notebook.
@@ -731,11 +787,13 @@ function activateNotebookHandler(
     return commands
       .execute('docmanager:new-untitled', { path: cwd, type: 'notebook' })
       .then(model => {
-        return commands.execute('docmanager:open', {
-          path: model.path,
-          factory: FACTORY,
-          kernel: { name: kernelName }
-        });
+        if (model != undefined) {
+          return commands.execute('docmanager:open', {
+            path: model.path,
+            factory: FACTORY,
+            kernel: { name: kernelName }
+          });
+        }
       });
   };
 
@@ -750,11 +808,11 @@ function activateNotebookHandler(
         );
       }
       if (args['isPalette']) {
-        return 'New Notebook';
+        return trans.__('New Notebook');
       }
-      return 'Notebook';
+      return trans.__('Notebook');
     },
-    caption: 'Create a new notebook',
+    caption: trans.__('Create a new notebook'),
     icon: args => (args['isPalette'] ? undefined : notebookIcon),
     execute: args => {
       const cwd =
@@ -779,21 +837,16 @@ function activateNotebookHandler(
           return;
         }
         disposables = new DisposableSet();
-        const baseUrl = PageConfig.getBaseUrl();
 
-        for (let name in specs.kernelspecs) {
-          let rank = name === specs.default ? 0 : Infinity;
+        for (const name in specs.kernelspecs) {
+          const rank = name === specs.default ? 0 : Infinity;
           const spec = specs.kernelspecs[name]!;
           let kernelIconUrl = spec.resources['logo-64x64'];
-          if (kernelIconUrl) {
-            let index = kernelIconUrl.indexOf('kernelspecs');
-            kernelIconUrl = URLExt.join(baseUrl, kernelIconUrl.slice(index));
-          }
           disposables.add(
             launcher.add({
               command: CommandIDs.createNew,
               args: { isLauncher: true, kernelName: name },
-              category: 'Notebook',
+              category: trans.__('Notebook'),
               rank,
               kernelIconUrl,
               metadata: {
@@ -809,127 +862,6 @@ function activateNotebookHandler(
       services.kernelspecs.specsChanged.connect(onSpecsChanged);
     });
   }
-
-  // Cell context menu groups
-  app.contextMenu.addItem({
-    type: 'separator',
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 0
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.cut,
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 1
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.copy,
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 2
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.pasteBelow,
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 3
-  });
-  app.contextMenu.addItem({
-    type: 'separator',
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 4
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.deleteCell,
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 5
-  });
-  app.contextMenu.addItem({
-    type: 'separator',
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 6
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.split,
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 7
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.merge,
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 8
-  });
-  app.contextMenu.addItem({
-    type: 'separator',
-    selector: '.jp-Notebook .jp-Cell',
-    rank: 9
-  });
-
-  // CodeCell context menu groups
-  app.contextMenu.addItem({
-    command: CommandIDs.createOutputView,
-    selector: '.jp-Notebook .jp-CodeCell',
-    rank: 10
-  });
-  app.contextMenu.addItem({
-    type: 'separator',
-    selector: '.jp-Notebook .jp-CodeCell',
-    rank: 11
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.clearOutputs,
-    selector: '.jp-Notebook .jp-CodeCell',
-    rank: 12
-  });
-
-  // Notebook context menu groups
-  app.contextMenu.addItem({
-    command: CommandIDs.clearAllOutputs,
-    selector: '.jp-Notebook',
-    rank: 0
-  });
-  app.contextMenu.addItem({
-    type: 'separator',
-    selector: '.jp-Notebook',
-    rank: 1
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.enableOutputScrolling,
-    selector: '.jp-Notebook',
-    rank: 2
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.disableOutputScrolling,
-    selector: '.jp-Notebook',
-    rank: 3
-  });
-  app.contextMenu.addItem({
-    type: 'separator',
-    selector: '.jp-Notebook',
-    rank: 4
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.undoCellAction,
-    selector: '.jp-Notebook',
-    rank: 5
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.redoCellAction,
-    selector: '.jp-Notebook',
-    rank: 6
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.restart,
-    selector: '.jp-Notebook',
-    rank: 7
-  });
-  app.contextMenu.addItem({
-    type: 'separator',
-    selector: '.jp-Notebook',
-    rank: 8
-  });
-  app.contextMenu.addItem({
-    command: CommandIDs.createConsole,
-    selector: '.jp-Notebook',
-    rank: 9
-  });
 
   // FIXME as unknown
   return tracker as unknown as INotebookTracker;
@@ -2011,9 +1943,11 @@ function addCommands(
  */
 function populatePalette(
   palette: ICommandPalette,
-  services: ServiceManager
+  translator: ITranslator
 ): void {
-  let category = 'Notebook Operations';
+  const trans = translator.load('jupyterlab');
+  let category = trans.__('Notebook Operations');
+
   [
     CommandIDs.interrupt,
     CommandIDs.restart,
@@ -2034,7 +1968,10 @@ function populatePalette(
     CommandIDs.reconnectToKernel,
     CommandIDs.createConsole,
     CommandIDs.closeAndShutdown,
-    CommandIDs.trust
+    CommandIDs.trust,
+    CommandIDs.toggleCollapseCmd,
+    CommandIDs.collapseAllCmd,
+    CommandIDs.expandAllCmd
   ].forEach(command => {
     palette.addItem({ command, category });
   });
@@ -2045,7 +1982,7 @@ function populatePalette(
     args: { isPalette: true }
   });
 
-  category = 'Notebook Cell Operations';
+  category = trans.__('Notebook Cell Operations');
   [
     CommandIDs.run,
     CommandIDs.runAndAdvance,
@@ -2063,6 +2000,8 @@ function populatePalette(
     CommandIDs.deleteCell,
     CommandIDs.split,
     CommandIDs.merge,
+    CommandIDs.mergeAbove,
+    CommandIDs.mergeBelow,
     CommandIDs.insertAbove,
     CommandIDs.insertBelow,
     CommandIDs.selectAbove,
@@ -2089,6 +2028,8 @@ function populatePalette(
     CommandIDs.showOutput,
     CommandIDs.hideAllOutputs,
     CommandIDs.showAllOutputs,
+    CommandIDs.toggleRenderSideBySide,
+    CommandIDs.setSideBySideRatio,
     CommandIDs.enableOutputScrolling,
     CommandIDs.disableOutputScrolling
   ].forEach(command => {
@@ -2103,12 +2044,11 @@ function populateMenus(
   app: JupyterFrontEnd,
   mainMenu: IMainMenu,
   tracker: INotebookTracker,
-  services: ServiceManager,
-  palette: ICommandPalette | null,
+  translator: ITranslator,
   sessionDialogs: ISessionContextDialogs | null
 ): void {
-  let { commands } = app;
-
+  const trans = translator.load('jupyterlab');
+  const { commands } = app;
   sessionDialogs = sessionDialogs || sessionContextDialogs;
 
   // Add undo/redo hooks to the edit menu.
@@ -2125,10 +2065,11 @@ function populateMenus(
 
   // Add a clearer to the edit menu
   mainMenu.editMenu.clearers.add({
-    // FIXME as unknown
     tracker: tracker as unknown as NotebookTracker,
-    noun: 'Outputs',
-    pluralNoun: 'Outputs',
+    clearCurrentLabel: (n: number) => trans.__('Clear Output'),
+    clearAllLabel: (n: number) => {
+      return trans.__('Clear All Outputs');
+    },
     clearCurrent: (current: NotebookPanel) => {
       return NotebookActions.clearOutputs(current.content);
     },
@@ -2137,20 +2078,16 @@ function populateMenus(
     }
   } as IEditMenu.IClearer<NotebookPanel>);
 
-  // Add new notebook creation to the file menu.
-  mainMenu.fileMenu.newMenu.addGroup([{ command: CommandIDs.createNew }], 10);
-
   // Add a close and shutdown command to the file menu.
   mainMenu.fileMenu.closeAndCleaners.add({
-    // FIXME as unknown
     tracker: tracker as unknown as NotebookTracker,
-    action: 'Shutdown',
-    name: 'Notebook',
+    closeAndCleanupLabel: (n: number) =>
+      trans.__('Close and Shutdown Notebook'),
     closeAndCleanup: (current: NotebookPanel) => {
       const fileName = current.title.label;
       return showDialog({
-        title: 'Shut down the notebook?',
-        body: `Are you sure you want to close "${fileName}"?`,
+        title: trans.__('Shut down the Notebook?'),
+        body: trans.__('Are you sure you want to close "%1"?', fileName),
         buttons: [Dialog.cancelButton(), Dialog.warnButton()]
       }).then(result => {
         if (result.button.accept) {
@@ -2162,97 +2099,49 @@ function populateMenus(
     }
   } as IFileMenu.ICloseAndCleaner<NotebookPanel>);
 
-  // Add a notebook group to the File menu.
-  let exportTo = new Menu({ commands });
-  exportTo.title.label = 'Export Notebook As…';
-  void services.nbconvert.getExportFormats().then(response => {
-    if (response) {
-      // Convert export list to palette and menu items.
-      const formatList = Object.keys(response);
-      formatList.forEach(function(key) {
-        let capCaseKey = key[0].toUpperCase() + key.substr(1);
-        let labelStr = FORMAT_LABEL[key] ? FORMAT_LABEL[key] : capCaseKey;
-        let args = {
-          format: key,
-          label: labelStr,
-          isPalette: true
-        };
-        if (FORMAT_EXCLUDE.indexOf(key) === -1) {
-          exportTo.addItem({
-            command: CommandIDs.exportToFormat,
-            args: args
-          });
-          if (palette) {
-            const category = 'Notebook Operations';
-            palette.addItem({
-              command: CommandIDs.exportToFormat,
-              category,
-              args
-            });
-          }
-        }
-      });
-      const fileGroup = [
-        { type: 'submenu', submenu: exportTo } as Menu.IItemOptions
-      ];
-      mainMenu.fileMenu.addGroup(fileGroup, 10);
-    }
-  });
-
   // Add a kernel user to the Kernel menu
   mainMenu.kernelMenu.kernelUsers.add({
     // FIXME as unknown
     tracker: tracker as unknown as NotebookTracker,
     interruptKernel: current => {
-      let kernel = current.sessionContext.session?.kernel;
+      const kernel = current.sessionContext.session?.kernel;
       if (kernel) {
         return kernel.interrupt();
       }
       return Promise.resolve(void 0);
     },
-    noun: 'All Outputs',
-    restartKernel: current => sessionDialogs!.restart(current.sessionContext),
+    reconnectToKernel: current => {
+      const kernel = current.sessionContext.session?.kernel;
+      if (kernel) {
+        return kernel.reconnect();
+      }
+      return Promise.resolve(void 0);
+    },
+    restartKernelAndClearLabel: (n: number) =>
+      trans.__('Restart Kernel and Clear All Outputs…'),
+    restartKernel: current =>
+      sessionDialogs!.restart(current.sessionContext, translator),
     restartKernelAndClear: current => {
-      return sessionDialogs!.restart(current.sessionContext).then(restarted => {
-        if (restarted) {
-          NotebookActions.clearAllOutputs(current.content);
-        }
-        return restarted;
-      });
+      return sessionDialogs!
+        .restart(current.sessionContext, translator)
+        .then(restarted => {
+          if (restarted) {
+            NotebookActions.clearAllOutputs(current.content);
+          }
+          return restarted;
+        });
     },
     changeKernel: current =>
-      sessionDialogs!.selectKernel(current.sessionContext),
+      sessionDialogs!.selectKernel(current.sessionContext, translator),
     shutdownKernel: current => current.sessionContext.shutdown()
   } as IKernelMenu.IKernelUser<NotebookPanel>);
 
   // Add a console creator the the Kernel menu
   mainMenu.fileMenu.consoleCreators.add({
-    // FIXME as unknown
     tracker: tracker as unknown as NotebookTracker,
-    name: 'Notebook',
+    createConsoleLabel: (n: number) => trans.__('New Console for Notebook'),
     createConsole: current => Private.createConsole(commands, current, true)
   } as IFileMenu.IConsoleCreator<NotebookPanel>);
-
-  // Add some commands to the application view menu.
-  const collapseGroup = [
-    CommandIDs.hideCode,
-    CommandIDs.hideOutput,
-    CommandIDs.hideAllCode,
-    CommandIDs.hideAllOutputs
-  ].map(command => {
-    return { command };
-  });
-  mainMenu.viewMenu.addGroup(collapseGroup, 10);
-
-  const expandGroup = [
-    CommandIDs.showCode,
-    CommandIDs.showOutput,
-    CommandIDs.showAllCode,
-    CommandIDs.showAllOutputs
-  ].map(command => {
-    return { command };
-  });
-  mainMenu.viewMenu.addGroup(expandGroup, 11);
 
   // Add an IEditorViewer to the application view menu
   mainMenu.viewMenu.editorViewers.add({
@@ -2273,9 +2162,11 @@ function populateMenus(
 
   // Add an ICodeRunner to the application run menu
   mainMenu.runMenu.codeRunners.add({
-    // FIXME as unknown
     tracker: tracker as unknown as NotebookTracker,
-    noun: 'Cells',
+    runLabel: (n: number) => trans.__('Run Selected Cells'),
+    runAllLabel: (n: number) => trans.__('Run All Cells'),
+    restartAndRunAllLabel: (n: number) =>
+      trans.__('Restart Kernel and Run All Cells…'),
     run: current => {
       const { context, content } = current;
       return NotebookActions.runAndAdvance(
@@ -2291,79 +2182,16 @@ function populateMenus(
     },
     restartAndRunAll: current => {
       const { context, content } = current;
-      return sessionDialogs!.restart(context.sessionContext).then(restarted => {
-        if (restarted) {
-          void NotebookActions.runAll(content, context.sessionContext);
-        }
-        return restarted;
-      });
+      return sessionDialogs!
+        .restart(context.sessionContext, translator)
+        .then(restarted => {
+          if (restarted) {
+            void NotebookActions.runAll(content, context.sessionContext);
+          }
+          return restarted;
+        });
     }
   } as IRunMenu.ICodeRunner<NotebookPanel>);
-
-  // Add a renderAllMarkdown group to the run menu.
-  const renderAllMarkdown = [CommandIDs.renderAllMarkdown].map(command => {
-    return { command };
-  });
-  // Add a run+insert and run+don't advance group to the run menu.
-  const runExtras = [
-    CommandIDs.runAndInsert,
-    CommandIDs.run,
-    CommandIDs.runInConsole
-  ].map(command => {
-    return { command };
-  });
-
-  // Add a run all above/below group to the run menu.
-  const runAboveBelowGroup = [
-    CommandIDs.runAllAbove,
-    CommandIDs.runAllBelow
-  ].map(command => {
-    return { command };
-  });
-
-  // Add commands to the application edit menu.
-  const undoCellActionGroup = [
-    CommandIDs.undoCellAction,
-    CommandIDs.redoCellAction
-  ].map(command => {
-    return { command };
-  });
-
-  const copyGroup = [
-    CommandIDs.cut,
-    CommandIDs.copy,
-    CommandIDs.pasteBelow,
-    CommandIDs.pasteAbove,
-    CommandIDs.pasteAndReplace
-  ].map(command => {
-    return { command };
-  });
-
-  const selectGroup = [CommandIDs.selectAll, CommandIDs.deselectAll].map(
-    command => {
-      return { command };
-    }
-  );
-
-  const splitMergeGroup = [CommandIDs.split, CommandIDs.merge].map(command => {
-    return { command };
-  });
-
-  const moveCellsGroup = [CommandIDs.moveUp, CommandIDs.moveDown].map(
-    command => {
-      return { command };
-    }
-  );
-
-  mainMenu.editMenu.addGroup(undoCellActionGroup, 4);
-  mainMenu.editMenu.addGroup(copyGroup, 5);
-  mainMenu.editMenu.addGroup([{ command: CommandIDs.deleteCell }], 6);
-  mainMenu.editMenu.addGroup(selectGroup, 7);
-  mainMenu.editMenu.addGroup(moveCellsGroup, 8);
-  mainMenu.editMenu.addGroup(splitMergeGroup, 9);
-  mainMenu.runMenu.addGroup(runExtras, 10);
-  mainMenu.runMenu.addGroup(runAboveBelowGroup, 11);
-  mainMenu.runMenu.addGroup(renderAllMarkdown, 12);
 
   // Add kernel information to the application help menu.
   mainMenu.helpMenu.kernelUsers.add({
