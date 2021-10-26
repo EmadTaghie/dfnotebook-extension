@@ -14,20 +14,21 @@ import {
 import {
   Dialog,
   ICommandPalette,
+  InputDialog,
   ISessionContextDialogs,
-  MainAreaWidget,
+  // MainAreaWidget,
   showDialog,
-  WidgetTracker,
+  // WidgetTracker,
   sessionContextDialogs
 } from '@jupyterlab/apputils';
 
-import { CodeCell } from '@dfnotebook/dfcells';
+import { Cell, CodeCell, ICellModel, MarkdownCell } from '@dfnotebook/dfcells';
 
 import { IEditorServices } from '@jupyterlab/codeeditor';
 
-import { PageConfig } from '@jupyterlab/coreutils';
+// import { PageConfig } from '@jupyterlab/coreutils';
 
-import { IDocumentManager } from '@jupyterlab/docmanager';
+// import { IDocumentManager } from '@jupyterlab/docmanager';
 
 import { IFileBrowserFactory } from '@jupyterlab/filebrowser';
 
@@ -52,6 +53,7 @@ import {
 } from '@jupyterlab/notebook'
 
 import {
+  Notebook,
   NotebookTools,
   NotebookActions,
   NotebookModelFactory,
@@ -62,12 +64,16 @@ import {
   CommandEditStatus,
   NotebookTrustStatus,
 } from '@dfnotebook/dfnotebook';
+import {
+  IObservableList,
+  IObservableUndoableList
+} from '@jupyterlab/observables';
 
 import { IPropertyInspectorProvider } from '@jupyterlab/property-inspector';
 
 import { IRenderMimeRegistry } from '@jupyterlab/rendermime';
 
-import { ServiceManager } from '@jupyterlab/services';
+// import { ServiceManager } from '@jupyterlab/services';
 
 import { ISettingRegistry } from '@jupyterlab/settingregistry';
 
@@ -601,7 +607,6 @@ function activateWidgetFactory(
 function activateNotebookHandler(
   app: JupyterFrontEnd,
   factory: NotebookWidgetFactory.IFactory,
-  docManager: IDocumentManager,
   translator: ITranslator,
   palette: ICommandPalette | null,
   browserFactory: IFileBrowserFactory | null,
@@ -616,12 +621,6 @@ function activateNotebookHandler(
 
   const { commands } = app;
   const tracker = new NotebookTracker({ namespace: 'notebook' });
-
-  const clonedOutputs = new WidgetTracker<
-      MainAreaWidget<Private.ClonedOutputArea>
-      >({
-    namespace: 'cloned-outputs'
-  });
 
   // Fetch settings if possible.
   const fetchSettings = settingRegistry
@@ -690,14 +689,8 @@ function activateNotebookHandler(
   });
   registry.addModelFactory(modelFactory);
 
-  addCommands(
-    app,
-    docManager,
-    services,
-    tracker,
-    clonedOutputs,
-    sessionDialogs
-  );
+  addCommands(app, tracker, translator, sessionDialogs);
+
   if (palette) {
     populatePalette(palette, translator);
   }
@@ -871,66 +864,101 @@ function activateNotebookHandler(
   return tracker as unknown as INotebookTracker;
 }
 
+function getCurrent(
+  tracker: INotebookTracker,
+  shell: JupyterFrontEnd.IShell,
+  args: ReadonlyPartialJSONObject
+): NotebookPanel | null {
+  const widget = tracker.currentWidget;
+  const activate = args['activate'] !== false;
+
+  if (activate && widget) {
+    shell.activateById(widget.id);
+  }
+
+  return widget as unknown as NotebookPanel;
+}
+
 /**
  * Add the notebook commands to the application's command registry.
  */
 function addCommands(
   app: JupyterFrontEnd,
-  docManager: IDocumentManager,
-  services: ServiceManager,
   tracker: NotebookTracker,
-  clonedOutputs: WidgetTracker<MainAreaWidget>,
+  translator: ITranslator,
   sessionDialogs: ISessionContextDialogs | null
 ): void {
+  const trans = translator.load('jupyterlab');
   const { commands, shell } = app;
 
   sessionDialogs = sessionDialogs ?? sessionContextDialogs;
 
-  // Get the current widget and activate unless the args specify otherwise.
-  function getCurrent(args: ReadonlyPartialJSONObject): NotebookPanel | null {
-    const widget = tracker.currentWidget;
-    const activate = args['activate'] !== false;
+  const isEnabled = (): boolean => {
+    return Private.isEnabled(shell, tracker as unknown as INotebookTracker);
+  };
 
-    if (activate && widget) {
-      shell.activateById(widget.id);
-    }
+  const isEnabledAndSingleSelected = (): boolean => {
+    return Private.isEnabledAndSingleSelected(shell, tracker as unknown as INotebookTracker);
+  };
 
-    return widget;
-  }
-
-  /**
-   * Whether there is an active notebook.
-   */
-  function isEnabled(): boolean {
-    return (
-      tracker.currentWidget !== null &&
-      tracker.currentWidget === shell.currentWidget
-    );
-  }
-
-  /**
-   * Whether there is an notebook active, with a single selected cell.
-   */
-  function isEnabledAndSingleSelected(): boolean {
-    if (!isEnabled()) {
-      return false;
-    }
-    const { content } = tracker.currentWidget!;
-    const index = content.activeCellIndex;
-    // If there are selections that are not the active cell,
-    // this command is confusing, so disable it.
-    for (let i = 0; i < content.widgets.length; ++i) {
-      if (content.isSelected(content.widgets[i]) && i !== index) {
-        return false;
+  const refreshCellCollapsed = (notebook: Notebook): void => {
+    for (const cell of notebook.widgets) {
+      if (cell instanceof MarkdownCell && cell.headingCollapsed) {
+        NotebookActions.setHeadingCollapse(cell, true, notebook);
+      }
+      if (cell.model.id === notebook.activeCell?.model?.id) {
+        NotebookActions.expandParent(cell, notebook);
       }
     }
-    return true;
-  }
+  };
+
+  const isEnabledAndHeadingSelected = (): boolean => {
+    return Private.isEnabledAndHeadingSelected(shell, tracker as unknown as INotebookTracker);
+  };
+
+  // Set up collapse signal for each header cell in a notebook
+  tracker.currentChanged.connect(
+    (sender: NotebookTracker, panel: NotebookPanel) => {
+      if (!panel?.content?.model?.cells) {
+        return;
+      }
+      panel.content.model.cells.changed.connect(
+        (
+          list: IObservableUndoableList<ICellModel>,
+          args: IObservableList.IChangedArgs<ICellModel>
+        ) => {
+          const cell = panel.content.widgets[args.newIndex];
+          if (
+            cell instanceof MarkdownCell &&
+            (args.type === 'add' || args.type === 'set')
+          ) {
+            cell.toggleCollapsedSignal.connect(
+              (newCell: MarkdownCell, collapsing: boolean) => {
+                NotebookActions.setHeadingCollapse(
+                  newCell,
+                  collapsing,
+                  panel.content
+                );
+              }
+            );
+          }
+          // Might be overkill to refresh this every time, but
+          // it helps to keep the collapse state consistent.
+          refreshCellCollapsed(panel.content);
+        }
+      );
+      panel.content.activeCellChanged.connect(
+        (notebook: Notebook, cell: Cell) => {
+          NotebookActions.expandParent(cell, notebook);
+        }
+      );
+    }
+  );
 
   commands.addCommand(CommandIDs.runAndAdvance, {
-    label: 'Run Selected Cells',
+    label: trans.__('Run Selected Cells'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         const { context, content } = current;
@@ -941,9 +969,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.run, {
-    label: "Run Selected Cells and Don't Advance",
+    label: trans.__("Run Selected Cells and Don't Advance"),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         const { context, content } = current;
@@ -954,9 +982,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.runAndInsert, {
-    label: 'Run Selected Cells and Insert Below',
+    label: trans.__('Run Selected Cells and Insert Below'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         const { context, content } = current;
@@ -966,129 +994,10 @@ function addCommands(
     },
     isEnabled
   });
-  commands.addCommand(CommandIDs.runInConsole, {
-    label: 'Run Selected Text or Current Line in Console',
-    execute: async args => {
-      // Default to not activating the notebook (thereby putting the notebook
-      // into command mode)
-      const current = getCurrent({ activate: false, ...args });
-
-      if (!current) {
-        return;
-      }
-
-      const { context, content } = current;
-
-      let cell = content.activeCell;
-      let metadata = cell?.model.metadata.toJSON();
-      let path = context.path;
-      // ignore action in non-code cell
-      if (!cell || cell.model.type !== 'code') {
-        return;
-      }
-
-      let code: string;
-      const editor = cell.editor;
-      const selection = editor.getSelection();
-      const { start, end } = selection;
-      let selected = start.column !== end.column || start.line !== end.line;
-
-      if (selected) {
-        // Get the selected code from the editor.
-        const start = editor.getOffsetAt(selection.start);
-        const end = editor.getOffsetAt(selection.end);
-        code = editor.model.value.text.substring(start, end);
-      } else {
-        // no selection, find the complete statement around the current line
-        const cursor = editor.getCursorPosition();
-        let srcLines = editor.model.value.text.split('\n');
-        let curLine = selection.start.line;
-        while (
-          curLine < editor.lineCount &&
-          !srcLines[curLine].replace(/\s/g, '').length
-        ) {
-          curLine += 1;
-        }
-        // if curLine > 0, we first do a search from beginning
-        let fromFirst = curLine > 0;
-        let firstLine = 0;
-        let lastLine = firstLine + 1;
-        while (true) {
-          code = srcLines.slice(firstLine, lastLine).join('\n');
-          let reply = await current.context.sessionContext.session?.kernel?.requestIsComplete(
-            {
-              // ipython needs an empty line at the end to correctly identify completeness of indented code
-              code: code + '\n\n'
-            }
-          );
-          if (reply?.content.status === 'complete') {
-            if (curLine < lastLine) {
-              // we find a block of complete statement containing the current line, great!
-              while (
-                lastLine < editor.lineCount &&
-                !srcLines[lastLine].replace(/\s/g, '').length
-              ) {
-                lastLine += 1;
-              }
-              editor.setCursorPosition({
-                line: lastLine,
-                column: cursor.column
-              });
-              break;
-            } else {
-              // discard the complete statement before the current line and continue
-              firstLine = lastLine;
-              lastLine = firstLine + 1;
-            }
-          } else if (lastLine < editor.lineCount) {
-            // if incomplete and there are more lines, add the line and check again
-            lastLine += 1;
-          } else if (fromFirst) {
-            // we search from the first line and failed, we search again from current line
-            firstLine = curLine;
-            lastLine = curLine + 1;
-            fromFirst = false;
-          } else {
-            // if we have searched both from first line and from current line and we
-            // cannot find anything, we submit the current line.
-            code = srcLines[curLine];
-            while (
-              curLine + 1 < editor.lineCount &&
-              !srcLines[curLine + 1].replace(/\s/g, '').length
-            ) {
-              curLine += 1;
-            }
-            editor.setCursorPosition({
-              line: curLine + 1,
-              column: cursor.column
-            });
-            break;
-          }
-        }
-      }
-
-      if (!code) {
-        return;
-      }
-
-      await commands.execute('console:open', {
-        activate: false,
-        insertMode: 'split-bottom',
-        path
-      });
-      await commands.execute('console:inject', {
-        activate: false,
-        code,
-        path,
-        metadata
-      });
-    },
-    isEnabled
-  });
   commands.addCommand(CommandIDs.runAll, {
-    label: 'Run All Cells',
+    label: trans.__('Run All Cells'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         const { context, content } = current;
@@ -1099,9 +1008,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.runAllAbove, {
-    label: 'Run All Above Selected Cell',
+    label: trans.__('Run All Above Selected Cell'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         const { context, content } = current;
@@ -1119,9 +1028,9 @@ function addCommands(
     }
   });
   commands.addCommand(CommandIDs.runAllBelow, {
-    label: 'Run Selected Cell and All Below',
+    label: trans.__('Run Selected Cell and All Below'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         const { context, content } = current;
@@ -1140,9 +1049,9 @@ function addCommands(
     }
   });
   commands.addCommand(CommandIDs.renderAllMarkdown, {
-    label: 'Render All Markdown Cells',
+    label: trans.__('Render All Markdown Cells'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
       if (current) {
         const { context, content } = current;
         return NotebookActions.renderAllMarkdown(
@@ -1154,20 +1063,20 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.restart, {
-    label: 'Restart Kernel…',
+    label: trans.__('Restart Kernel…'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
-        return sessionDialogs!.restart(current.sessionContext);
+        return sessionDialogs!.restart(current.sessionContext, translator);
       }
     },
     isEnabled
   });
   commands.addCommand(CommandIDs.closeAndShutdown, {
-    label: 'Close and Shut Down',
+    label: trans.__('Close and Shut Down'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (!current) {
         return;
@@ -1176,8 +1085,8 @@ function addCommands(
       const fileName = current.title.label;
 
       return showDialog({
-        title: 'Shut down the notebook?',
-        body: `Are you sure you want to close "${fileName}"?`,
+        title: trans.__('Shut down the notebook?'),
+        body: trans.__('Are you sure you want to close "%1"?', fileName),
         buttons: [Dialog.cancelButton(), Dialog.warnButton()]
       }).then(result => {
         if (result.button.accept) {
@@ -1190,9 +1099,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.trust, {
-    label: () => 'Trust Notebook',
+    label: () => trans.__('Trust Notebook'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
       if (current) {
         const { context, content } = current;
         return NotebookActions.trust(content).then(() => context.save());
@@ -1200,52 +1109,15 @@ function addCommands(
     },
     isEnabled
   });
-  commands.addCommand(CommandIDs.exportToFormat, {
-    label: args => {
-      const formatLabel = args['label'] as string;
-
-      return (args['isPalette'] ? 'Export Notebook to ' : '') + formatLabel;
-    },
-    execute: args => {
-      const current = getCurrent(args);
-
-      if (!current) {
-        return;
-      }
-
-      const url = PageConfig.getNBConvertURL({
-        format: args['format'] as string,
-        download: true,
-        path: current.context.path
-      });
-      const child = window.open('', '_blank');
-      const { context } = current;
-
-      if (child) {
-        child.opener = null;
-      }
-      if (context.model.dirty && !context.model.readOnly) {
-        return context.save().then(() => {
-          child?.location.assign(url);
-        });
-      }
-
-      return new Promise<void>(resolve => {
-        child?.location.assign(url);
-        resolve(undefined);
-      });
-    },
-    isEnabled
-  });
   commands.addCommand(CommandIDs.restartClear, {
-    label: 'Restart Kernel and Clear All Outputs…',
+    label: trans.__('Restart Kernel and Clear All Outputs…'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         const { content, sessionContext } = current;
 
-        return sessionDialogs!.restart(sessionContext).then(() => {
+        return sessionDialogs!.restart(sessionContext, translator).then(() => {
           NotebookActions.clearAllOutputs(content);
         });
       }
@@ -1253,13 +1125,13 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.restartAndRunToSelected, {
-    label: 'Restart Kernel and Run up to Selected Cell…',
+    label: trans.__('Restart Kernel and Run up to Selected Cell…'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
       if (current) {
         const { context, content } = current;
         return sessionDialogs!
-          .restart(current.sessionContext)
+          .restart(current.sessionContext, translator)
           .then(restarted => {
             if (restarted) {
               void NotebookActions.runAllAbove(
@@ -1274,33 +1146,32 @@ function addCommands(
           });
       }
     },
-    isEnabled: () => {
-      // Can't run if there are multiple cells selected
-      return isEnabledAndSingleSelected();
-    }
+    isEnabled: isEnabledAndSingleSelected
   });
   commands.addCommand(CommandIDs.restartRunAll, {
-    label: 'Restart Kernel and Run All Cells…',
+    label: trans.__('Restart Kernel and Run All Cells…'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         const { context, content, sessionContext } = current;
 
-        return sessionDialogs!.restart(sessionContext).then(restarted => {
-          if (restarted) {
-            void NotebookActions.runAll(content, context.sessionContext);
-          }
-          return restarted;
-        });
+        return sessionDialogs!
+          .restart(sessionContext, translator)
+          .then(restarted => {
+            if (restarted) {
+              void NotebookActions.runAll(content, context.sessionContext);
+            }
+            return restarted;
+          });
       }
     },
     isEnabled
   });
   commands.addCommand(CommandIDs.clearAllOutputs, {
-    label: 'Clear All Outputs',
+    label: trans.__('Clear All Outputs'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.clearAllOutputs(current.content);
@@ -1309,9 +1180,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.clearOutputs, {
-    label: 'Clear Outputs',
+    label: trans.__('Clear Outputs'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.clearOutputs(current.content);
@@ -1320,9 +1191,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.interrupt, {
-    label: 'Interrupt Kernel',
+    label: trans.__('Interrupt Kernel'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (!current) {
         return;
@@ -1337,9 +1208,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.toCode, {
-    label: 'Change to Code Cell Type',
+    label: trans.__('Change to Code Cell Type'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.changeCellType(current.content, 'code');
@@ -1348,9 +1219,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.toMarkdown, {
-    label: 'Change to Markdown Cell Type',
+    label: trans.__('Change to Markdown Cell Type'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.changeCellType(current.content, 'markdown');
@@ -1359,9 +1230,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.toRaw, {
-    label: 'Change to Raw Cell Type',
+    label: trans.__('Change to Raw Cell Type'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.changeCellType(current.content, 'raw');
@@ -1370,9 +1241,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.cut, {
-    label: 'Cut Cells',
+    label: trans.__('Cut Cells'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.cut(current.content);
@@ -1381,9 +1252,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.copy, {
-    label: 'Copy Cells',
+    label: trans.__('Copy Cells'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.copy(current.content);
@@ -1392,9 +1263,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.pasteBelow, {
-    label: 'Paste Cells Below',
+    label: trans.__('Paste Cells Below'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.paste(current.content, 'below');
@@ -1403,9 +1274,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.pasteAbove, {
-    label: 'Paste Cells Above',
+    label: trans.__('Paste Cells Above'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.paste(current.content, 'above');
@@ -1414,9 +1285,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.pasteAndReplace, {
-    label: 'Paste Cells and Replace',
+    label: trans.__('Paste Cells and Replace'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.paste(current.content, 'replace');
@@ -1425,9 +1296,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.deleteCell, {
-    label: 'Delete Cells',
+    label: trans.__('Delete Cells'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.deleteCells(current.content);
@@ -1436,9 +1307,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.split, {
-    label: 'Split Cell',
+    label: trans.__('Split Cell'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.splitCell(current.content);
@@ -1447,9 +1318,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.merge, {
-    label: 'Merge Selected Cells',
+    label: trans.__('Merge Selected Cells'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.mergeCells(current.content);
@@ -1457,10 +1328,32 @@ function addCommands(
     },
     isEnabled
   });
-  commands.addCommand(CommandIDs.insertAbove, {
-    label: 'Insert Cell Above',
+  commands.addCommand(CommandIDs.mergeAbove, {
+    label: trans.__('Merge Cell Above'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
+
+      if (current) {
+        return NotebookActions.mergeCells(current.content, true);
+      }
+    },
+    isEnabled
+  });
+  commands.addCommand(CommandIDs.mergeBelow, {
+    label: trans.__('Merge Cell Below'),
+    execute: args => {
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
+
+      if (current) {
+        return NotebookActions.mergeCells(current.content, false);
+      }
+    },
+    isEnabled
+  });
+  commands.addCommand(CommandIDs.insertAbove, {
+    label: trans.__('Insert Cell Above'),
+    execute: args => {
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.insertAbove(current.content);
@@ -1469,9 +1362,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.insertBelow, {
-    label: 'Insert Cell Below',
+    label: trans.__('Insert Cell Below'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.insertBelow(current.content);
@@ -1480,9 +1373,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.selectAbove, {
-    label: 'Select Cell Above',
+    label: trans.__('Select Cell Above'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.selectAbove(current.content);
@@ -1491,9 +1384,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.selectBelow, {
-    label: 'Select Cell Below',
+    label: trans.__('Select Cell Below'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.selectBelow(current.content);
@@ -1502,9 +1395,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.extendAbove, {
-    label: 'Extend Selection Above',
+    label: trans.__('Extend Selection Above'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.extendSelectionAbove(current.content);
@@ -1513,9 +1406,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.extendTop, {
-    label: 'Extend Selection to Top',
+    label: trans.__('Extend Selection to Top'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.extendSelectionAbove(current.content, true);
@@ -1524,9 +1417,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.extendBelow, {
-    label: 'Extend Selection Below',
+    label: trans.__('Extend Selection Below'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.extendSelectionBelow(current.content);
@@ -1535,9 +1428,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.extendBottom, {
-    label: 'Extend Selection to Bottom',
+    label: trans.__('Extend Selection to Bottom'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.extendSelectionBelow(current.content, true);
@@ -1546,9 +1439,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.selectAll, {
-    label: 'Select All Cells',
+    label: trans.__('Select All Cells'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.selectAll(current.content);
@@ -1557,9 +1450,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.deselectAll, {
-    label: 'Deselect All Cells',
+    label: trans.__('Deselect All Cells'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.deselectAll(current.content);
@@ -1568,9 +1461,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.moveUp, {
-    label: 'Move Cells Up',
+    label: trans.__('Move Cells Up'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.moveUp(current.content);
@@ -1579,9 +1472,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.moveDown, {
-    label: 'Move Cells Down',
+    label: trans.__('Move Cells Down'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.moveDown(current.content);
@@ -1590,9 +1483,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.toggleAllLines, {
-    label: 'Toggle All Line Numbers',
+    label: trans.__('Toggle All Line Numbers'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.toggleAllLineNumbers(current.content);
@@ -1601,9 +1494,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.commandMode, {
-    label: 'Enter Command Mode',
+    label: trans.__('Enter Command Mode'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         current.content.mode = 'command';
@@ -1612,9 +1505,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.editMode, {
-    label: 'Enter Edit Mode',
+    label: trans.__('Enter Edit Mode'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         current.content.mode = 'edit';
@@ -1623,9 +1516,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.undoCellAction, {
-    label: 'Undo Cell Operation',
+    label: trans.__('Undo Cell Operation'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.undo(current.content);
@@ -1634,9 +1527,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.redoCellAction, {
-    label: 'Redo Cell Operation',
+    label: trans.__('Redo Cell Operation'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.redo(current.content);
@@ -1645,20 +1538,23 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.changeKernel, {
-    label: 'Change Kernel…',
+    label: trans.__('Change Kernel…'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
-        return sessionDialogs!.selectKernel(current.context.sessionContext);
+        return sessionDialogs!.selectKernel(
+          current.context.sessionContext,
+          translator
+        );
       }
     },
     isEnabled
   });
   commands.addCommand(CommandIDs.reconnectToKernel, {
-    label: 'Reconnect To Kernel',
+    label: trans.__('Reconnect To Kernel'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (!current) {
         return;
@@ -1672,80 +1568,10 @@ function addCommands(
     },
     isEnabled
   });
-  commands.addCommand(CommandIDs.createOutputView, {
-    label: 'Create New View for Output',
-    execute: async args => {
-      let cell: CodeCell | undefined;
-      let current: NotebookPanel | undefined | null;
-      // If we are given a notebook path and cell index, then
-      // use that, otherwise use the current active cell.
-      let path = args.path as string | undefined | null;
-      let index = args.index as number | undefined | null;
-      if (path && index !== undefined && index !== null) {
-        current = docManager.findWidget(path, FACTORY) as NotebookPanel;
-        if (!current) {
-          return;
-        }
-      } else {
-        current = getCurrent({ ...args, activate: false });
-        if (!current) {
-          return;
-        }
-        cell = current.content.activeCell as CodeCell;
-        index = current.content.activeCellIndex;
-      }
-      // Create a MainAreaWidget
-      const content = new Private.ClonedOutputArea({
-        notebook: current,
-        cell,
-        index
-      });
-      const widget = new MainAreaWidget({ content });
-      current.context.addSibling(widget, {
-        ref: current.id,
-        mode: 'split-bottom'
-      });
-
-      const updateCloned = () => {
-        void clonedOutputs.save(widget);
-      };
-
-      current.context.pathChanged.connect(updateCloned);
-      current.context.model?.cells.changed.connect(updateCloned);
-
-      // Add the cloned output to the output widget tracker.
-      void clonedOutputs.add(widget);
-
-      // Remove the output view if the parent notebook is closed.
-      current.content.disposed.connect(() => {
-        current!.context.pathChanged.disconnect(updateCloned);
-        current!.context.model?.cells.changed.disconnect(updateCloned);
-        widget.dispose();
-      });
-    },
-    isEnabled: isEnabledAndSingleSelected
-  });
-  commands.addCommand(CommandIDs.createConsole, {
-    label: 'New Console for Notebook',
-    execute: args => {
-      const current = getCurrent({ ...args, activate: false });
-
-      if (!current) {
-        return;
-      }
-
-      return Private.createConsole(
-        commands,
-        current,
-        args['activate'] as boolean
-      );
-    },
-    isEnabled
-  });
   commands.addCommand(CommandIDs.markdown1, {
-    label: 'Change to Heading 1',
+    label: trans.__('Change to Heading 1'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.setMarkdownHeader(current.content, 1);
@@ -1754,9 +1580,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.markdown2, {
-    label: 'Change to Heading 2',
+    label: trans.__('Change to Heading 2'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.setMarkdownHeader(current.content, 2);
@@ -1765,9 +1591,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.markdown3, {
-    label: 'Change to Heading 3',
+    label: trans.__('Change to Heading 3'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.setMarkdownHeader(current.content, 3);
@@ -1776,9 +1602,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.markdown4, {
-    label: 'Change to Heading 4',
+    label: trans.__('Change to Heading 4'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.setMarkdownHeader(current.content, 4);
@@ -1787,9 +1613,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.markdown5, {
-    label: 'Change to Heading 5',
+    label: trans.__('Change to Heading 5'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.setMarkdownHeader(current.content, 5);
@@ -1798,9 +1624,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.markdown6, {
-    label: 'Change to Heading 6',
+    label: trans.__('Change to Heading 6'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.setMarkdownHeader(current.content, 6);
@@ -1809,9 +1635,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.hideCode, {
-    label: 'Collapse Selected Code',
+    label: trans.__('Collapse Selected Code'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.hideCode(current.content);
@@ -1820,9 +1646,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.showCode, {
-    label: 'Expand Selected Code',
+    label: trans.__('Expand Selected Code'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.showCode(current.content);
@@ -1831,9 +1657,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.hideAllCode, {
-    label: 'Collapse All Code',
+    label: trans.__('Collapse All Code'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.hideAllCode(current.content);
@@ -1842,9 +1668,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.showAllCode, {
-    label: 'Expand All Code',
+    label: trans.__('Expand All Code'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.showAllCode(current.content);
@@ -1853,9 +1679,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.hideOutput, {
-    label: 'Collapse Selected Outputs',
+    label: trans.__('Collapse Selected Outputs'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.hideOutput(current.content);
@@ -1864,9 +1690,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.showOutput, {
-    label: 'Expand Selected Outputs',
+    label: trans.__('Expand Selected Outputs'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.showOutput(current.content);
@@ -1875,9 +1701,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.hideAllOutputs, {
-    label: 'Collapse All Outputs',
+    label: trans.__('Collapse All Outputs'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.hideAllOutputs(current.content);
@@ -1885,10 +1711,54 @@ function addCommands(
     },
     isEnabled
   });
-  commands.addCommand(CommandIDs.showAllOutputs, {
-    label: 'Expand All Outputs',
+
+  commands.addCommand(CommandIDs.toggleRenderSideBySide, {
+    label: trans.__('Render Side-by-side'),
     execute: args => {
-      const current = getCurrent(args);
+      Private.renderSideBySide = !Private.renderSideBySide;
+      tracker.forEach(wideget => {
+        if (wideget) {
+          if (Private.renderSideBySide) {
+            return NotebookActions.renderSideBySide(wideget.content);
+          } else {
+            return NotebookActions.renderNotSideBySide(wideget.content);
+          }
+        }
+      });
+      tracker.currentChanged.connect(() => {
+        if (Private.renderSideBySide && tracker.currentWidget) {
+          return NotebookActions.renderSideBySide(
+            tracker.currentWidget.content
+          );
+        }
+      });
+    },
+    isToggled: () => Private.renderSideBySide,
+    isEnabled
+  });
+
+  commands.addCommand(CommandIDs.setSideBySideRatio, {
+    label: trans.__('Set side-by-side ratio'),
+    execute: args => {
+      InputDialog.getNumber({
+        title: trans.__('Width of the output in side-by-side mode'),
+        value: 1
+      })
+        .then(result => {
+          if (result.value) {
+            document.documentElement.style.setProperty(
+              '--jp-side-by-side-output-size',
+              `${result.value}fr`
+            );
+          }
+        })
+        .catch(console.error);
+    }
+  });
+  commands.addCommand(CommandIDs.showAllOutputs, {
+    label: trans.__('Expand All Outputs'),
+    execute: args => {
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.showAllOutputs(current.content);
@@ -1897,9 +1767,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.enableOutputScrolling, {
-    label: 'Enable Scrolling for Outputs',
+    label: trans.__('Enable Scrolling for Outputs'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.enableOutputScrolling(current.content);
@@ -1908,9 +1778,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.disableOutputScrolling, {
-    label: 'Disable Scrolling for Outputs',
+    label: trans.__('Disable Scrolling for Outputs'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.disableOutputScrolling(current.content);
@@ -1919,9 +1789,9 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.selectLastRunCell, {
-    label: 'Select current running or last run cell',
+    label: trans.__('Select current running or last run cell'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
 
       if (current) {
         return NotebookActions.selectLastRunCell(current.content);
@@ -1930,15 +1800,43 @@ function addCommands(
     isEnabled
   });
   commands.addCommand(CommandIDs.replaceSelection, {
-    label: 'Replace Selection in Notebook Cell',
+    label: trans.__('Replace Selection in Notebook Cell'),
     execute: args => {
-      const current = getCurrent(args);
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
       const text: string = (args['text'] as string) || '';
       if (current) {
         return NotebookActions.replaceSelection(current.content, text);
       }
     },
     isEnabled
+  });
+  commands.addCommand(CommandIDs.toggleCollapseCmd, {
+    label: 'Toggle Collapse Notebook Heading',
+    execute: args => {
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
+      if (current) {
+        return NotebookActions.toggleCurrentHeadingCollapse(current.content);
+      }
+    },
+    isEnabled: isEnabledAndHeadingSelected
+  });
+  commands.addCommand(CommandIDs.collapseAllCmd, {
+    label: 'Collapse All Cells',
+    execute: args => {
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
+      if (current) {
+        return NotebookActions.collapseAll(current.content);
+      }
+    }
+  });
+  commands.addCommand(CommandIDs.expandAllCmd, {
+    label: 'Expand All Headings',
+    execute: args => {
+      const current = getCurrent(tracker as unknown as INotebookTracker, shell, args);
+      if (current) {
+        return NotebookActions.expandAllHeadings(current.content);
+      }
+    }
   });
 }
 
@@ -2231,8 +2129,72 @@ namespace Private {
 
     return commands.execute('console:create', options);
   }
+
+  /**
+   * Whether there is an active notebook.
+   */
+  export function isEnabled(
+    shell: JupyterFrontEnd.IShell,
+    tracker: INotebookTracker
+  ): boolean {
+    return (
+      tracker.currentWidget !== null &&
+      tracker.currentWidget === shell.currentWidget
+    );
+  }
+
+  /**
+   * Whether there is an notebook active, with a single selected cell.
+   */
+  export function isEnabledAndSingleSelected(
+    shell: JupyterFrontEnd.IShell,
+    tracker: INotebookTracker
+  ): boolean {
+    if (!Private.isEnabled(shell, tracker)) {
+      return false;
+    }
+    const { content } = tracker.currentWidget!;
+    const index = content.activeCellIndex;
+    // If there are selections that are not the active cell,
+    // this command is confusing, so disable it.
+    for (let i = 0; i < content.widgets.length; ++i) {
+      if (content.isSelected(content.widgets[i]) && i !== index) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Whether there is an notebook active, with a single selected cell.
+   */
+  export function isEnabledAndHeadingSelected(
+    shell: JupyterFrontEnd.IShell,
+    tracker: INotebookTracker
+  ): boolean {
+    if (!Private.isEnabled(shell, tracker)) {
+      return false;
+    }
+    const { content } = tracker.currentWidget!;
+    const index = content.activeCellIndex;
+    if (!(content.activeCell instanceof MarkdownCell)) {
+      return false;
+    }
+    // If there are selections that are not the active cell,
+    // this command is confusing, so disable it.
+    for (let i = 0; i < content.widgets.length; ++i) {
+      if (content.isSelected(content.widgets[i]) && i !== index) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * The default Export To ... formats and their human readable labels.
+   */
   export function getFormatLabels(
-      translator: ITranslator
+    translator: ITranslator
   ): { [k: string]: string } {
     translator = translator || nullTranslator;
     const trans = translator.load('jupyterlab');
@@ -2246,12 +2208,14 @@ namespace Private {
       slides: trans.__('Reveal.js Slides')
     };
   }
+
   /**
    * A widget hosting a cloned output area.
    */
   export class ClonedOutputArea extends Panel {
     constructor(options: ClonedOutputArea.IOptions) {
       super();
+      const trans = (options.translator || nullTranslator).load('jupyterlab');
       this._notebook = options.notebook;
       this._index = options.index !== undefined ? options.index : -1;
       this._cell = options.cell || null;
@@ -2259,8 +2223,8 @@ namespace Private {
       this.title.label = 'Output View';
       this.title.icon = notebookIcon;
       this.title.caption = this._notebook.title.label
-        ? `For Notebook: ${this._notebook.title.label}`
-        : 'For Notebook:';
+        ? trans.__('For Notebook: %1', this._notebook.title.label)
+        : trans.__('For Notebook:');
       this.addClass('jp-LinkedOutputView');
 
       // Wait for the notebook to be loaded before
@@ -2322,6 +2286,14 @@ namespace Private {
        * of the cell for when the notebook is loaded.
        */
       index?: number;
+
+      /**
+       * If the cell is not available, provide the index
+       * of the cell for when the notebook is loaded.
+       */
+      translator?: ITranslator;
     }
   }
+
+  export let renderSideBySide = false;
 }
